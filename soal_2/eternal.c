@@ -113,12 +113,12 @@ static void leave_alt_screen(void) {
 }
 
 static void print_banner(void) {
-    printf("%s ____   _ _____ _____ _     _____   ___  _____ \n%s", ui("\033[33m"), ui("\033[0m"));
-    printf("%s| __ ) / \\_   _|_   _| |   | ____| / _ \\|  ___|\n%s", ui("\033[33m"), ui("\033[0m"));
-    printf("%s|  _ \\/ _ \\| |   | | | |   |  _|  | | | | |_   \n%s", ui("\033[33m"), ui("\033[0m"));
-    printf("%s| |_) / ___ \\ |   | | | |___| |___ | |_| |  _|  \n%s", ui("\033[36m"), ui("\033[0m"));
-    printf("%s|____/_/   \\_\\_|   |_| |_____|_____| \\___/|_|    \n%s", ui("\033[36m"), ui("\033[0m"));
-    printf("%s                 E T E R I O N%s\n\n", ui("\033[36m"), ui("\033[0m"));
+    printf("%s _____ _      _   _ __  __    _    ____  \n%s", ui("\033[33m"), ui("\033[0m"));
+    printf("%s| ____| |    | | | |  \\/  |  / \\  |  _ \\ \n%s", ui("\033[33m"), ui("\033[0m"));
+    printf("%s|  _| | |    | | | | |\\/| | / _ \\ | |_) |\n%s", ui("\033[33m"), ui("\033[0m"));
+    printf("%s| |___| |___ | |_| | |  | |/ ___ \\|  _ < \n%s", ui("\033[36m"), ui("\033[0m"));
+    printf("%s|_____|_____| \\___/|_|  |_/_/   \\_\\_| \\_\\\n%s", ui("\033[36m"), ui("\033[0m"));
+    printf("%s                  EL UMAR%s\n\n", ui("\033[36m"), ui("\033[0m"));
 }
 
 static void draw_meter(const char *label, int current, int max, int width, char fill) {
