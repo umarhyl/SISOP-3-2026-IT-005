@@ -248,11 +248,32 @@ static void show_profile(void) {
     int dmg = calc_base_damage(&acc);
     int hp = calc_base_health(&acc);
 
-    printf("%s+--------------------------- PROFILE ---------------------------+\n%s", ui("\033[36m"), ui("\033[0m"));
-    printf("| Name : %-16s  Lvl : %-3d  Gold : %-5d |\n", acc.username, level, acc.gold);
-    printf("| XP   : %-16d  Dmg : %-3d  HP   : %-5d |\n", acc.xp, dmg, hp);
-    printf("| Weapon : %-52s |\n", equipped ? equipped->name : "None");
-    printf("%s+---------------------------------------------------------------+\n%s", ui("\033[36m"), ui("\033[0m"));
+    printf("%s%s\n%s",
+           ui("\033[36m"),
+           g_ui_ansi ? "┌─────────────────────────── PROFILE ───────────────────────────┐"
+                     : "+--------------------------- PROFILE ---------------------------+",
+           ui("\033[0m"));
+    printf("%s Name : %-16s  Lvl : %-3d  Gold : %-5d %s\n",
+           g_ui_ansi ? "│" : "|",
+           acc.username,
+           level,
+           acc.gold,
+           g_ui_ansi ? "│" : "|");
+    printf("%s XP   : %-16d  Dmg : %-3d  HP   : %-5d %s\n",
+           g_ui_ansi ? "│" : "|",
+           acc.xp,
+           dmg,
+           hp,
+           g_ui_ansi ? "│" : "|");
+    printf("%s Weapon : %-52s %s\n",
+           g_ui_ansi ? "│" : "|",
+           equipped ? equipped->name : "None",
+           g_ui_ansi ? "│" : "|");
+    printf("%s%s\n%s",
+           ui("\033[36m"),
+           g_ui_ansi ? "└───────────────────────────────────────────────────────────────┘"
+                     : "+---------------------------------------------------------------+",
+           ui("\033[0m"));
 }
 
 static void show_history(void) {
@@ -261,7 +282,11 @@ static void show_history(void) {
 
     clear_screen();
     print_banner();
-    printf("%s-------------------- MATCH HISTORY --------------------%s\n", ui("\033[35m"), ui("\033[0m"));
+    printf("%s%s%s\n",
+           ui("\033[35m"),
+           g_ui_ansi ? "──────────────────── MATCH HISTORY ────────────────────"
+                     : "-------------------- MATCH HISTORY --------------------",
+           ui("\033[0m"));
     printf("%s%-8s %-12s %-6s %-8s %-8s%s\n", ui("\033[35m"), "Time", "Opponent", "Res", "XP", "Gold", ui("\033[0m"));
     if (acc.history_count == 0) {
         printf("No history yet.\n");
@@ -295,7 +320,11 @@ static void show_armory(void) {
     Account acc = get_account_snapshot(g_user_index);
     clear_screen();
     print_banner();
-    printf("%s------------------------ ARMORY ------------------------%s\n", ui("\033[33m"), ui("\033[0m"));
+    printf("%s%s%s\n",
+           ui("\033[33m"),
+           g_ui_ansi ? "──────────────────────── ARMORY ────────────────────────"
+                     : "------------------------ ARMORY ------------------------",
+           ui("\033[0m"));
     printf("Gold: %d\n\n", acc.gold);
     for (i = 0; i < MAX_WEAPONS; i++) {
         printf("%d. %-12s  %4d G  %+4d Dmg\n", i + 1, g_weapons[i].name, g_weapons[i].cost, g_weapons[i].bonus);
@@ -327,12 +356,20 @@ static void show_logged_menu(void) {
     clear_screen();
     print_banner();
     show_profile();
-    printf("\n%s+------------------ MENU ------------------+\n%s", ui("\033[36m"), ui("\033[0m"));
-    printf("| 1. Battle                                |\n");
-    printf("| 2. Armory                                |\n");
-    printf("| 3. History                               |\n");
-    printf("| 4. Logout                                |\n");
-    printf("%s+------------------------------------------+\n%s", ui("\033[36m"), ui("\033[0m"));
+    printf("\n%s%s\n%s",
+           ui("\033[36m"),
+           g_ui_ansi ? "┌────────────────── MENU ──────────────────┐"
+                     : "+------------------ MENU ------------------+",
+           ui("\033[0m"));
+    printf("%s 1. Battle                                %s\n", g_ui_ansi ? "│" : "|", g_ui_ansi ? "│" : "|");
+    printf("%s 2. Armory                                %s\n", g_ui_ansi ? "│" : "|", g_ui_ansi ? "│" : "|");
+    printf("%s 3. History                               %s\n", g_ui_ansi ? "│" : "|", g_ui_ansi ? "│" : "|");
+    printf("%s 4. Logout                                %s\n", g_ui_ansi ? "│" : "|", g_ui_ansi ? "│" : "|");
+    printf("%s%s\n%s",
+           ui("\033[36m"),
+           g_ui_ansi ? "└──────────────────────────────────────────┘"
+                     : "+------------------------------------------+",
+           ui("\033[0m"));
 }
 
 static void show_guest_menu(void) {
@@ -374,7 +411,11 @@ static void render_battle_screen(const BattleRoom *room, int my_side, const char
     } else {
         clear_screen();
     }
-    printf("%s+------------------------------ ARENA ------------------------------+\n%s", ui("\033[31m"), ui("\033[0m"));
+    printf("%s%s\n%s",
+           ui("\033[31m"),
+           g_ui_ansi ? "┌────────────────────────────── ARENA ──────────────────────────────┐"
+                     : "+------------------------------ ARENA ------------------------------+",
+           ui("\033[0m"));
     printf("%s%-10s%s Lvl %-2d\n", ui("\033[36m"), opp_name, ui("\033[0m"), (me->xp / 100) + 1);
     draw_meter("Enemy", opp_hp, opp_max, UI_BAR_WIDTH, '=');
     printf("\n%sVS%s\n\n", ui("\033[35m"), ui("\033[0m"));
@@ -399,7 +440,11 @@ static void render_battle_screen(const BattleRoom *room, int my_side, const char
         printf("  [U] Locked");
     }
     printf("\n");
-    printf("%s+-------------------------------------------------------------------+\n%s", ui("\033[31m"), ui("\033[0m"));
+    printf("%s%s\n%s",
+           ui("\033[31m"),
+           g_ui_ansi ? "└───────────────────────────────────────────────────────────────────┘"
+                     : "+-------------------------------------------------------------------+",
+           ui("\033[0m"));
     fflush(stdout);
 }
 
