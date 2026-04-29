@@ -34,6 +34,8 @@ static ArenaAux *g_aux = NULL;
 static int g_user_index = -1;
 static struct termios g_orig_term;
 static int g_orig_flags = 0;
+static int g_ui_ansi = 0;
+static int g_in_alt_screen = 0;
 
 static const Weapon g_weapons[] = {
     {"Wood Sword", 100, 5},
@@ -47,6 +49,110 @@ static long long now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000LL);
+}
+
+static const char *ui(const char *code) {
+    return g_ui_ansi ? code : "";
+}
+
+static void detect_ui_mode(void) {
+    const char *term = getenv("TERM");
+    g_ui_ansi = isatty(STDOUT_FILENO) && term && strcmp(term, "dumb") != 0;
+}
+
+static void sleep_ms(int ms) {
+    struct timespec req;
+    req.tv_sec = ms / 1000;
+    req.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&req, NULL);
+}
+
+static int calc_base_damage(const Account *acc) {
+    return BASE_DAMAGE + (acc->xp / 50) + acc->weapon_bonus;
+}
+
+static int calc_base_health(const Account *acc) {
+    return BASE_HEALTH + (acc->xp / 10);
+}
+
+static const Weapon *get_equipped_weapon(int weapon_bonus) {
+    const Weapon *equipped = NULL;
+    int i;
+    for (i = 0; i < MAX_WEAPONS; i++) {
+        if (g_weapons[i].bonus <= weapon_bonus) {
+            equipped = &g_weapons[i];
+        }
+    }
+    return equipped;
+}
+
+static void clear_screen(void) {
+    if (g_ui_ansi) {
+        printf("\033[2J\033[H");
+    } else {
+        printf("\n");
+    }
+}
+
+static void enter_alt_screen(void) {
+    if (!g_ui_ansi || g_in_alt_screen) {
+        return;
+    }
+    printf("\033[?1049h\033[?25l");
+    fflush(stdout);
+    g_in_alt_screen = 1;
+}
+
+static void leave_alt_screen(void) {
+    if (!g_in_alt_screen) {
+        return;
+    }
+    printf("\033[?25h\033[?1049l");
+    fflush(stdout);
+    g_in_alt_screen = 0;
+}
+
+static void print_banner(void) {
+    printf("%s ____   _ _____ _____ _     _____   ___  _____ \n%s", ui("\033[33m"), ui("\033[0m"));
+    printf("%s| __ ) / \\_   _|_   _| |   | ____| / _ \\|  ___|\n%s", ui("\033[33m"), ui("\033[0m"));
+    printf("%s|  _ \\/ _ \\| |   | | | |   |  _|  | | | | |_   \n%s", ui("\033[33m"), ui("\033[0m"));
+    printf("%s| |_) / ___ \\ |   | | | |___| |___ | |_| |  _|  \n%s", ui("\033[36m"), ui("\033[0m"));
+    printf("%s|____/_/   \\_\\_|   |_| |_____|_____| \\___/|_|    \n%s", ui("\033[36m"), ui("\033[0m"));
+    printf("%s                 E T E R I O N%s\n\n", ui("\033[36m"), ui("\033[0m"));
+}
+
+static void draw_meter(const char *label, int current, int max, int width, char fill) {
+    int i;
+    int safe_max = (max > 0) ? max : 1;
+    int safe_current = current;
+    int filled;
+
+    if (safe_current < 0) {
+        safe_current = 0;
+    }
+    if (safe_current > safe_max) {
+        safe_current = safe_max;
+    }
+    filled = (safe_current * width) / safe_max;
+
+    printf("%-10s[", label);
+    for (i = 0; i < width; i++) {
+        putchar(i < filled ? fill : ' ');
+    }
+    printf("] %d/%d\n", safe_current, max);
+}
+
+static long long cooldown_left_ms(const BattleRoom *room, int my_side) {
+    long long last_action = (my_side == 1) ? room->last_action_ms1 : room->last_action_ms2;
+    long long elapsed;
+    if (last_action <= 0) {
+        return 0;
+    }
+    elapsed = now_ms() - last_action;
+    if (elapsed >= COOLDOWN_MS) {
+        return 0;
+    }
+    return COOLDOWN_MS - elapsed;
 }
 
 static void lock_sem(void) {
@@ -80,6 +186,11 @@ static int read_int(const char *prompt) {
     char buf[64];
     read_line(prompt, buf, sizeof(buf));
     return atoi(buf);
+}
+
+static void wait_enter(const char *prompt) {
+    char dummy[8];
+    read_line(prompt, dummy, sizeof(dummy));
 }
 
 static void enable_raw_mode(void) {
@@ -132,27 +243,29 @@ static BattleRoom get_room_snapshot(int room_id) {
 
 static void show_profile(void) {
     Account acc = get_account_snapshot(g_user_index);
+    const Weapon *equipped = get_equipped_weapon(acc.weapon_bonus);
     int level = (acc.xp / 100) + 1;
-    int dmg = BASE_DAMAGE + (acc.xp / 50) + acc.weapon_bonus;
-    int hp = BASE_HEALTH + (acc.xp / 10);
+    int dmg = calc_base_damage(&acc);
+    int hp = calc_base_health(&acc);
 
-    printf("\n=== PROFILE ===\n");
-    printf("User : %s\n", acc.username);
-    printf("Gold : %d\n", acc.gold);
-    printf("Lvl  : %d\n", level);
-    printf("XP   : %d\n", acc.xp);
-    printf("Dmg  : %d\n", dmg);
-    printf("HP   : %d\n", hp);
-    printf("Weapon Bonus : %d\n", acc.weapon_bonus);
+    printf("%s+--------------------------- PROFILE ---------------------------+\n%s", ui("\033[36m"), ui("\033[0m"));
+    printf("| Name : %-16s  Lvl : %-3d  Gold : %-5d |\n", acc.username, level, acc.gold);
+    printf("| XP   : %-16d  Dmg : %-3d  HP   : %-5d |\n", acc.xp, dmg, hp);
+    printf("| Weapon : %-52s |\n", equipped ? equipped->name : "None");
+    printf("%s+---------------------------------------------------------------+\n%s", ui("\033[36m"), ui("\033[0m"));
 }
 
 static void show_history(void) {
     Account acc = get_account_snapshot(g_user_index);
     int i;
 
-    printf("\n=== MATCH HISTORY ===\n");
+    clear_screen();
+    print_banner();
+    printf("%s-------------------- MATCH HISTORY --------------------%s\n", ui("\033[35m"), ui("\033[0m"));
+    printf("%s%-8s %-12s %-6s %-8s %-8s%s\n", ui("\033[35m"), "Time", "Opponent", "Res", "XP", "Gold", ui("\033[0m"));
     if (acc.history_count == 0) {
         printf("No history yet.\n");
+        wait_enter("Press ENTER...");
         return;
     }
 
@@ -165,72 +278,155 @@ static void show_history(void) {
         } else {
             snprintf(tbuf, sizeof(tbuf), "--:--:--");
         }
-        printf("%s | %-10s | %s | XP %+d | Gold %+d\n",
+        printf("%-8s %-12s %s%-6s%s %+8d %+8d\n",
                tbuf,
                h->opponent,
+               h->win ? ui("\033[32m") : ui("\033[31m"),
                h->win ? "WIN" : "LOSS",
+               ui("\033[0m"),
                h->xp_gain,
                h->gold_gain);
     }
+    wait_enter("\nPress ENTER...");
 }
 
 static void show_armory(void) {
     int i;
-    printf("\n=== ARMORY ===\n");
-    for (i = 0; i < (int)(sizeof(g_weapons) / sizeof(g_weapons[0])); i++) {
-        printf("%d. %-12s | Cost %d | Bonus %d\n", i + 1, g_weapons[i].name, g_weapons[i].cost, g_weapons[i].bonus);
+    Account acc = get_account_snapshot(g_user_index);
+    clear_screen();
+    print_banner();
+    printf("%s------------------------ ARMORY ------------------------%s\n", ui("\033[33m"), ui("\033[0m"));
+    printf("Gold: %d\n\n", acc.gold);
+    for (i = 0; i < MAX_WEAPONS; i++) {
+        printf("%d. %-12s  %4d G  %+4d Dmg\n", i + 1, g_weapons[i].name, g_weapons[i].cost, g_weapons[i].bonus);
     }
-    printf("0. Back\n");
+    printf("0. Back\n\n");
 
-    int choice = read_int("Choice: ");
-    if (choice <= 0) {
-        return;
+    {
+        int choice = read_int("Choice: ");
+        if (choice <= 0) {
+            return;
+        }
+
+        ArenaMessage msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.cmd = CMD_BUY;
+        msg.user_index = g_user_index;
+        msg.arg1 = choice - 1;
+        send_request(&msg);
+
+        ArenaResponse resp;
+        if (recv_response(&resp, 0) >= 0) {
+            printf("%s\n", resp.text);
+        }
     }
-
-    ArenaMessage msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.cmd = CMD_BUY;
-    msg.user_index = g_user_index;
-    msg.arg1 = choice - 1;
-    send_request(&msg);
-
-    ArenaResponse resp;
-    if (recv_response(&resp, 0) >= 0) {
-        printf("%s\n", resp.text);
-    }
+    wait_enter("Press ENTER...");
 }
 
-static void render_battle_screen(const BattleRoom *room, int my_side, const char *opp_name) {
+static void show_logged_menu(void) {
+    clear_screen();
+    print_banner();
+    show_profile();
+    printf("\n%s+------------------ MENU ------------------+\n%s", ui("\033[36m"), ui("\033[0m"));
+    printf("| 1. Battle                                |\n");
+    printf("| 2. Armory                                |\n");
+    printf("| 3. History                               |\n");
+    printf("| 4. Logout                                |\n");
+    printf("%s+------------------------------------------+\n%s", ui("\033[36m"), ui("\033[0m"));
+}
+
+static void show_guest_menu(void) {
+    clear_screen();
+    print_banner();
+    printf("1. Register\n");
+    printf("2. Login\n");
+    printf("3. Exit\n");
+}
+
+static void show_matchmaking_screen(int sec_left) {
+    clear_screen();
+    print_banner();
+    printf("%sSearching for an opponent... [%2ds]%s\n", ui("\033[31m"), sec_left, ui("\033[0m"));
+}
+
+static void show_battle_result(int is_win) {
+    printf("\n");
+    if (is_win) {
+        printf("%s=== VICTORY ===%s\n", ui("\033[32m"), ui("\033[0m"));
+    } else {
+        printf("%s=== DEFEAT ===%s\n", ui("\033[31m"), ui("\033[0m"));
+    }
+    printf("Battle ended. Press ENTER to continue...");
+    fflush(stdout);
+}
+
+static void render_battle_screen(const BattleRoom *room, int my_side, const char *opp_name, const Account *me) {
+    const Weapon *equipped = get_equipped_weapon(me->weapon_bonus);
     int my_hp = (my_side == 1) ? room->hp1 : room->hp2;
     int my_max = (my_side == 1) ? room->max_hp1 : room->max_hp2;
     int opp_hp = (my_side == 1) ? room->hp2 : room->hp1;
     int opp_max = (my_side == 1) ? room->max_hp2 : room->max_hp1;
+    long long cd_left = cooldown_left_ms(room, my_side);
     int i;
 
-    printf("\033[2J\033[H");
-    printf("=== ARENA ===\n\n");
-    printf("You    : %d/%d\n", my_hp, my_max);
-    printf("Enemy  : %s (%d/%d)\n\n", opp_name, opp_hp, opp_max);
-    printf("Actions: [a] attack  [u] ultimate\n\n");
-    printf("--- Combat Log ---\n");
-
-    for (i = 0; i < room->log_count; i++) {
-        int idx = (room->log_head + i) % LOG_LINES;
-        printf("%s\n", room->log[idx]);
+    if (g_ui_ansi) {
+        printf("\033[H");
+    } else {
+        clear_screen();
+    }
+    printf("%s+------------------------------ ARENA ------------------------------+\n%s", ui("\033[31m"), ui("\033[0m"));
+    printf("%s%-10s%s Lvl %-2d\n", ui("\033[36m"), opp_name, ui("\033[0m"), (me->xp / 100) + 1);
+    draw_meter("Enemy", opp_hp, opp_max, UI_BAR_WIDTH, '=');
+    printf("\n%sVS%s\n\n", ui("\033[35m"), ui("\033[0m"));
+    printf("%s%-10s%s Lvl %-2d | Weapon: %s\n", ui("\033[36m"), me->username, ui("\033[0m"), (me->xp / 100) + 1, equipped ? equipped->name : "None");
+    draw_meter("You", my_hp, my_max, UI_BAR_WIDTH, '=');
+    printf("\n%sCombat Log:%s\n", ui("\033[33m"), ui("\033[0m"));
+    for (i = 0; i < LOG_LINES; i++) {
+        if (i < room->log_count) {
+            int idx = (room->log_head + i) % LOG_LINES;
+            printf("> %s\n", room->log[idx]);
+        } else {
+            printf("> \n");
+        }
+    }
+    printf("\nCD: Atk(%.1fs) | Ult(%.1fs)\n",
+           (double)cd_left / 1000.0,
+           (me->weapon_bonus > 0) ? ((double)cd_left / 1000.0) : 0.0);
+    printf("Action: [A] Attack");
+    if (me->weapon_bonus > 0) {
+        printf("  [U] Ultimate x3");
+    } else {
+        printf("  [U] Locked");
     }
     printf("\n");
+    printf("%s+-------------------------------------------------------------------+\n%s", ui("\033[31m"), ui("\033[0m"));
     fflush(stdout);
 }
 
+static void send_battle_action(int room_id, int cmd) {
+    ArenaMessage msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.cmd = cmd;
+    msg.user_index = g_user_index;
+    msg.room_id = room_id;
+    send_request(&msg);
+}
+
 static void battle_loop(int room_id, const char *opp_name) {
-    long long last_send = 0;
     Account acc = get_account_snapshot(g_user_index);
     int my_side = 1;
+    int last_hp1 = -1, last_hp2 = -1;
+    int last_log_head = -1, last_log_count = -1;
+    int last_finished = -1, last_winner = -1;
+    int last_cd_step = -1, last_side = -1;
 
     enable_raw_mode();
+    enter_alt_screen();
+    clear_screen();
 
     while (1) {
         BattleRoom room = get_room_snapshot(room_id);
+        int need_render = 0;
         if (!room.in_use) {
             break;
         }
@@ -241,18 +437,34 @@ static void battle_loop(int room_id, const char *opp_name) {
             my_side = 2;
         }
 
-        render_battle_screen(&room, my_side, opp_name);
+        {
+            int step_ms = g_ui_ansi ? 100 : 1000;
+            int cd_step = (int)((cooldown_left_ms(&room, my_side) + step_ms - 1) / step_ms);
+            if (room.hp1 != last_hp1 || room.hp2 != last_hp2 ||
+                room.log_head != last_log_head || room.log_count != last_log_count ||
+                room.finished != last_finished || room.winner != last_winner ||
+                my_side != last_side || cd_step != last_cd_step) {
+                need_render = 1;
+            }
+            if (need_render) {
+                render_battle_screen(&room, my_side, opp_name, &acc);
+                last_hp1 = room.hp1;
+                last_hp2 = room.hp2;
+                last_log_head = room.log_head;
+                last_log_count = room.log_count;
+                last_finished = room.finished;
+                last_winner = room.winner;
+                last_side = my_side;
+                last_cd_step = cd_step;
+            }
+        }
 
         if (room.finished) {
-            const char *result = "DEFEAT";
-            if ((room.winner == 1 && my_side == 1) || (room.winner == 2 && my_side == 2)) {
-                result = "VICTORY";
-            }
-            printf("Battle ended: %s\n", result);
-            printf("Press ENTER to continue...\n");
-            fflush(stdout);
             disable_raw_mode();
-            getchar();
+            leave_alt_screen();
+            clear_screen();
+            show_battle_result((room.winner == 1 && my_side == 1) || (room.winner == 2 && my_side == 2));
+            wait_enter("");
             return;
         }
 
@@ -261,83 +473,82 @@ static void battle_loop(int room_id, const char *opp_name) {
         FD_ZERO(&set);
         FD_SET(STDIN_FILENO, &set);
         tv.tv_sec = 0;
-        tv.tv_usec = 200000;
+        tv.tv_usec = UI_REFRESH_MS * 1000;
 
         if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) > 0) {
             char ch;
             if (read(STDIN_FILENO, &ch, 1) > 0) {
-                long long now = now_ms();
-                if (now - last_send < COOLDOWN_MS) {
+                if (cooldown_left_ms(&room, my_side) > 0) {
                     continue;
                 }
 
                 if (ch == 'a' || ch == 'A') {
-                    ArenaMessage msg;
-                    memset(&msg, 0, sizeof(msg));
-                    msg.cmd = CMD_ATTACK;
-                    msg.user_index = g_user_index;
-                    msg.room_id = room_id;
-                    send_request(&msg);
-                    last_send = now;
+                    send_battle_action(room_id, CMD_ATTACK);
                 } else if (ch == 'u' || ch == 'U') {
                     if (acc.weapon_bonus <= 0) {
                         continue;
                     }
-                    ArenaMessage msg;
-                    memset(&msg, 0, sizeof(msg));
-                    msg.cmd = CMD_ULT;
-                    msg.user_index = g_user_index;
-                    msg.room_id = room_id;
-                    send_request(&msg);
-                    last_send = now;
+                    send_battle_action(room_id, CMD_ULT);
                 }
             }
         }
     }
 
     disable_raw_mode();
+    leave_alt_screen();
 }
 
 static void matchmaking(void) {
     ArenaMessage msg;
+    int last_sec = -1;
     memset(&msg, 0, sizeof(msg));
     msg.cmd = CMD_MATCH;
     msg.user_index = g_user_index;
     send_request(&msg);
 
-    printf("Searching for opponent...\n");
-
     long long start = now_ms();
     while (1) {
         ArenaResponse resp;
+        long long elapsed_ms = now_ms() - start;
+        int sec_left = MATCH_TIMEOUT_SEC - (int)(elapsed_ms / 1000LL);
+        if (sec_left < 0) {
+            sec_left = 0;
+        }
+
+        if (sec_left != last_sec) {
+            show_matchmaking_screen(sec_left);
+            last_sec = sec_left;
+        }
+
         int r = recv_response(&resp, IPC_NOWAIT);
         if (r >= 0) {
             if (resp.status != 0) {
                 printf("%s\n", resp.text);
+                wait_enter("Press ENTER...");
                 return;
             }
 
             if (resp.code == RESP_MATCH_FOUND) {
-                printf("Match found vs %s\n", resp.text);
                 battle_loop(resp.room_id, resp.text);
                 return;
             }
             if (resp.code == RESP_MATCH_BOT) {
-                printf("Match found vs Wild Beast\n");
-                battle_loop(resp.room_id, "Wild Beast");
+                battle_loop(resp.room_id, BOT_NAME);
                 return;
             }
         } else if (errno != ENOMSG) {
             perror("msgrcv");
+            wait_enter("Press ENTER...");
             return;
         }
 
         if (now_ms() - start > (long long)(MATCH_TIMEOUT_SEC + 5) * 1000LL) {
             printf("No response from server.\n");
+            wait_enter("Press ENTER...");
             return;
         }
 
-        usleep(100000);
+        sleep_ms(UI_REFRESH_MS);
     }
 }
 
@@ -354,14 +565,14 @@ static void logout_user(void) {
         if (resp.status == 0) {
             g_user_index = -1;
         }
+        wait_enter("Press ENTER...");
     }
 }
 
 static void user_menu(void) {
     while (g_user_index >= 0) {
-        show_profile();
-        printf("\n1. Battle\n2. Armory\n3. History\n4. Logout\n");
-        int choice = read_int("Choice: ");
+        show_logged_menu();
+        int choice = read_int("> Choice: ");
         switch (choice) {
             case 1:
                 matchmaking();
@@ -385,6 +596,9 @@ static void user_menu(void) {
 static void register_user(void) {
     char username[MAX_NAME];
     char password[MAX_PASS];
+    clear_screen();
+    print_banner();
+    printf("%sCREATE ACCOUNT%s\n", ui("\033[36m"), ui("\033[0m"));
 
     read_line("Username: ", username, sizeof(username));
     read_line("Password: ", password, sizeof(password));
@@ -399,12 +613,16 @@ static void register_user(void) {
     ArenaResponse resp;
     if (recv_response(&resp, 0) >= 0) {
         printf("%s\n", resp.text);
+        wait_enter("Press ENTER...");
     }
 }
 
 static void login_user(void) {
     char username[MAX_NAME];
     char password[MAX_PASS];
+    clear_screen();
+    print_banner();
+    printf("%sLOGIN%s\n", ui("\033[36m"), ui("\033[0m"));
 
     read_line("Username: ", username, sizeof(username));
     read_line("Password: ", password, sizeof(password));
@@ -419,6 +637,9 @@ static void login_user(void) {
     ArenaResponse resp;
     if (recv_response(&resp, 0) >= 0) {
         printf("%s\n", resp.text);
+        if (resp.status != 0 || resp.code != RESP_LOGIN_OK) {
+            wait_enter("Press ENTER...");
+        }
         if (resp.status == 0 && resp.code == RESP_LOGIN_OK) {
             g_user_index = resp.user_index;
             user_menu();
@@ -455,6 +676,8 @@ static int connect_ipc(void) {
 }
 
 int main(void) {
+    detect_ui_mode();
+
     if (connect_ipc() != 0) {
         printf("Orion are you there?\n");
         return 1;
@@ -469,8 +692,7 @@ int main(void) {
     unlock_sem();
 
     while (1) {
-        printf("\n=== ETERION GATE ===\n");
-        printf("1. Register\n2. Login\n3. Exit\n");
+        show_guest_menu();
         int choice = read_int("Choice: ");
         switch (choice) {
             case 1:

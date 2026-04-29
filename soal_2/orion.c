@@ -45,6 +45,13 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000LL);
 }
 
+static void sleep_ms(int ms) {
+    struct timespec req;
+    req.tv_sec = ms / 1000;
+    req.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&req, NULL);
+}
+
 static void lock_sem(void) {
     struct sembuf op = {0, -1, SEM_UNDO};
     semop(g_semid, &op, 1);
@@ -136,6 +143,18 @@ static int create_user(const char *username, const char *password) {
     return -1;
 }
 
+static Account *require_user(ArenaMessage *msg, int *idx_out) {
+    int idx = msg->user_index;
+    if (idx < 0 || idx >= MAX_USERS || !g_accounts->users[idx].used) {
+        send_response(msg->pid, 1, RESP_ERR, -1, -1, "Invalid user");
+        return NULL;
+    }
+    if (idx_out) {
+        *idx_out = idx;
+    }
+    return &g_accounts->users[idx];
+}
+
 static int find_free_room(long long now) {
     int i;
     for (i = 0; i < MAX_ROOMS; i++) {
@@ -180,8 +199,7 @@ static int user_in_queue(int user_index) {
 static void setup_room(BattleRoom *room, int room_id, int p1, int p2) {
     Account *acc1 = &g_accounts->users[p1];
     int p1_hp = calc_base_health(acc1->xp);
-    int p1_dmg = calc_base_damage(acc1->xp, acc1->weapon_bonus);
-    int p2_hp = BASE_HEALTH;
+    int p2_hp = (p2 >= 0) ? calc_base_health(g_accounts->users[p2].xp) : BASE_HEALTH;
 
     memset(room, 0, sizeof(*room));
     room->in_use = 1;
@@ -190,16 +208,8 @@ static void setup_room(BattleRoom *room, int room_id, int p1, int p2) {
     room->p2 = p2;
     room->hp1 = p1_hp;
     room->max_hp1 = p1_hp;
-
-    if (p2 >= 0) {
-        Account *acc2 = &g_accounts->users[p2];
-        p2_hp = calc_base_health(acc2->xp);
-        room->hp2 = p2_hp;
-        room->max_hp2 = p2_hp;
-    } else {
-        room->hp2 = p2_hp;
-        room->max_hp2 = p2_hp;
-    }
+    room->hp2 = p2_hp;
+    room->max_hp2 = p2_hp;
 
     room->last_action_ms1 = 0;
     room->last_action_ms2 = 0;
@@ -213,16 +223,13 @@ static void setup_room(BattleRoom *room, int room_id, int p1, int p2) {
         snprintf(msg, sizeof(msg), "%s vs %s", acc1->username, g_accounts->users[p2].username);
         add_log(room, msg);
     } else {
-        add_log(room, "Opponent: Wild Beast");
+        add_log(room, "Opponent: " BOT_NAME);
     }
-
-    (void)p1_dmg;
 }
 
 static void finish_battle(BattleRoom *room, int winner_side) {
     int p1 = room->p1;
     int p2 = room->p2;
-    const char *bot_name = "Wild Beast";
 
     room->finished = 1;
     room->winner = winner_side;
@@ -230,7 +237,7 @@ static void finish_battle(BattleRoom *room, int winner_side) {
 
     if (p1 >= 0) {
         Account *acc = &g_accounts->users[p1];
-        const char *opp = (p2 >= 0) ? g_accounts->users[p2].username : bot_name;
+        const char *opp = (p2 >= 0) ? g_accounts->users[p2].username : BOT_NAME;
         if (winner_side == 1) {
             acc->xp += 50;
             acc->gold += 120;
@@ -368,7 +375,7 @@ static void bot_tick(void) {
         room->last_action_ms2 = now;
         {
             char msgbuf[LOG_LEN];
-            snprintf(msgbuf, sizeof(msgbuf), "Wild Beast hits for %d dmg", dmg);
+            snprintf(msgbuf, sizeof(msgbuf), BOT_NAME " hits for %d dmg", dmg);
             add_log(room, msgbuf);
         }
 
@@ -480,13 +487,12 @@ static void handle_login(ArenaMessage *msg) {
 }
 
 static void handle_logout(ArenaMessage *msg) {
-    int idx = msg->user_index;
-    if (idx < 0 || idx >= MAX_USERS || !g_accounts->users[idx].used) {
-        send_response(msg->pid, 1, RESP_ERR, -1, -1, "Invalid user");
+    int idx;
+    Account *acc = require_user(msg, &idx);
+    if (!acc) {
         return;
     }
 
-    Account *acc = &g_accounts->users[idx];
     if (acc->state == USER_IN_BATTLE || acc->state == USER_MATCHING) {
         send_response(msg->pid, 1, RESP_ERR, idx, -1, "Cannot logout while busy");
         return;
@@ -499,13 +505,12 @@ static void handle_logout(ArenaMessage *msg) {
 }
 
 static void handle_match(ArenaMessage *msg) {
-    int idx = msg->user_index;
-    if (idx < 0 || idx >= MAX_USERS || !g_accounts->users[idx].used) {
-        send_response(msg->pid, 1, RESP_ERR, -1, -1, "Invalid user");
+    int idx;
+    Account *acc = require_user(msg, &idx);
+    if (!acc) {
         return;
     }
 
-    Account *acc = &g_accounts->users[idx];
     if (acc->state == USER_MATCHING || acc->state == USER_IN_BATTLE) {
         send_response(msg->pid, 1, RESP_ALREADY_MATCHING, idx, -1, "Already in queue or battle");
         return;
@@ -528,31 +533,30 @@ static void handle_match(ArenaMessage *msg) {
 }
 
 static void handle_cancel_match(ArenaMessage *msg) {
-    int idx = msg->user_index;
-    if (idx < 0 || idx >= MAX_USERS || !g_accounts->users[idx].used) {
-        send_response(msg->pid, 1, RESP_ERR, -1, -1, "Invalid user");
+    int idx;
+    Account *acc = require_user(msg, &idx);
+    if (!acc) {
         return;
     }
 
     remove_from_queue(idx);
-    g_accounts->users[idx].state = USER_ONLINE;
+    acc->state = USER_ONLINE;
     send_response(msg->pid, 0, RESP_OK, idx, -1, "Matchmaking canceled");
 }
 
 static void handle_buy(ArenaMessage *msg) {
-    int idx = msg->user_index;
+    int idx;
     int choice = msg->arg1;
-    if (idx < 0 || idx >= MAX_USERS || !g_accounts->users[idx].used) {
-        send_response(msg->pid, 1, RESP_ERR, -1, -1, "Invalid user");
+    Account *acc = require_user(msg, &idx);
+    if (!acc) {
         return;
     }
 
-    if (choice < 0 || choice >= (int)(sizeof(g_weapons) / sizeof(g_weapons[0]))) {
+    if (choice < 0 || choice >= MAX_WEAPONS) {
         send_response(msg->pid, 1, RESP_ERR, idx, -1, "Invalid choice");
         return;
     }
 
-    Account *acc = &g_accounts->users[idx];
     const Weapon *w = &g_weapons[choice];
     if (acc->gold < w->cost) {
         send_response(msg->pid, 1, RESP_BUY_FAIL, idx, -1, "Not enough gold");
@@ -709,7 +713,7 @@ int main(void) {
         bot_tick();
         unlock_sem();
 
-        usleep(100000);
+        sleep_ms(100);
     }
 
     cleanup_ipc();
