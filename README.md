@@ -193,36 +193,59 @@ Setiap koneksi baru, pesan ter-broadcast, panggilan RPC, maupun diskoneksi (`/ex
 
 ## Soal 2 - The Eternal of Eterion
 
-Pada soal nomor 2 diminta untuk membuat program yang menyimulasikan arena pertempuran bernama Eterion. Program ini menggunakan mekanisme IPC (Inter-Process Communication) untuk saling berkomunikasi, dengan beberapa tugas dan ketentuan khusus, yaitu:
+Pada soal nomor 2 diminta untuk membuat program yang menyimulasikan arena pertempuran bernama **Eterion**. Program ini menggunakan mekanisme IPC (Inter-Process Communication) untuk saling berkomunikasi, dengan beberapa tugas dan ketentuan khusus, yaitu:
 
-1. Membuat file arena.h sebagai pusat konfigurasi, struct, dan kunci (key) Shared Memory.
-
-2. Membuat program orion.c yang bertindak sebagai server untuk memproses logika pertempuran.
-
-3. Membuat program eternal.c yang bertindak sebagai client (disebut prajurit).
+1. Membuat file `arena.h` sebagai pusat konfigurasi, struct, dan key Shared Memory.
+2. Membuat program `orion.c` yang bertindak sebagai server untuk memproses logika pertempuran.
+3. Membuat program `eternal.c` yang bertindak sebagai client (prajurit).
 4. Menyediakan sistem registrasi dan login prajurit secara persisten menggunakan Shared Memory.
+5. Setiap akun baru memiliki status awal: Gold 150, Lvl 1, dan XP 0.
+6. Mengimplementasikan matchmaking selama 35 detik; jika tidak ada lawan maka melawan bot **Wild Beast**.
+7. Pertempuran berlangsung realtime asynchronous (bukan turn-based) dengan tombol `a` (Attack) dan `u` (Ultimate), cooldown 1 detik.
+8. Menghitung reward XP dan Gold setelah pertempuran, dengan level naik tiap kelipatan 100 XP.
 
-5. Setiap akun baru akan mendapatkan status awal: Gold 150, Lvl 1, dan XP 0.
+Berikut bagian-bagian penyelesaian soal 2.
 
-6. Mengimplementasikan sistem Matchmaking selama 35 detik. Jika tidak ada lawan, pemain akan melawan monster (bot) bernama "Wild Beast".
+## Pembahasan Kode
 
-7. Pertempuran berlangsung secara Realtime Asynchronous (bukan turn-based). Penyerangan dilakukan dengan menekan tombol a (Attack) atau u (Ultimate) dengan cooldown 1 detik.
+### 1) `arena.h` - Konfigurasi dasar arena
 
-8. Menghitung reward (XP dan Gold) setelah pertempuran usai, dengan sistem level yang meningkat tiap kelipatan 100 XP.
+```c
+#define DEFAULT_GOLD 150
+#define MATCH_TIMEOUT_SEC 35
+#define COOLDOWN_MS 1000
+#define BOT_NAME "Wild Beast"
 
-Berikut bagian-bagian penyelesaian soal 2:
+enum CmdType {
+    CMD_PING = 1,
+    CMD_REGISTER,
+    CMD_LOGIN,
+    CMD_LOGOUT,
+    CMD_MATCH,
+    CMD_CANCEL_MATCH,
+    CMD_ATTACK,
+    CMD_ULT,
+    CMD_BUY
+};
+```
 
-1. Struktur Data Shared Memory (`arena.h`)
+Bagian konstanta berfungsi sebagai **single source of truth** untuk aturan game: `DEFAULT_GOLD` memastikan akun baru langsung punya modal awal, `MATCH_TIMEOUT_SEC` mengatur batas tunggu matchmaking, `COOLDOWN_MS` mengatur jeda aksi agar spam serangan tidak terjadi, dan `BOT_NAME` menentukan identitas lawan fallback. Sementara `CmdType` adalah kontrak command dari client ke server, sehingga parsing request di server menjadi konsisten dan tidak ambigu.
 
 ```c
 typedef struct {
-    Account users[MAX_USERS];
-} ArenaAccounts;
+    int used;
+    char username[MAX_NAME];
+    char password[MAX_PASS];
+    int xp;
+    int gold;
+    int weapon_bonus;
+    pid_t active_pid;
+    int state;
+    MatchHistory history[MAX_HISTORY];
+    int history_count;
+} Account;
 
 typedef struct {
-    int magic;
-    int server_ready;
-    pid_t server_pid;
     int waiting_count;
     int waiting_users[MAX_MATCH_QUEUE];
     long long waiting_since[MAX_MATCH_QUEUE];
@@ -230,142 +253,320 @@ typedef struct {
 } ArenaRuntime;
 ```
 
-Terdapat pemisahan memori yang jelas antara ArenaAccounts (untuk data persisten prajurit seperti XP, Gold, status login) dan ArenaRuntime (untuk state server yang terus berubah secara volatil seperti antrean matchmaking dan status BattleRoom). Pemisahan blok memori ini memudahkan manajemen memori dan menjaga persistensi akun meskipun terjadi reset pertempuran.
+`Account` menyimpan data yang melekat pada pemain (identitas, progression, status, histori) sehingga profil tetap konsisten selama server hidup. `ArenaRuntime` menyimpan state yang berubah cepat di runtime (queue matchmaking dan room battle aktif), sehingga server bisa memisahkan data akun permanen dari data pertandingan sementara.
 
-2. Inisialisasi dan Koneksi IPC
-```c
-    g_shm_accounts_id = shmget(SHM_ACCOUNTS_KEY, sizeof(ArenaAccounts), IPC_CREAT | 0666);
-    g_shm_runtime_id = shmget(SHM_RUNTIME_KEY, sizeof(ArenaRuntime), IPC_CREAT | 0666);
-    g_shm_aux_id = shmget(SHM_AUX_KEY, sizeof(ArenaAux), IPC_CREAT | 0666);
-    
-    g_accounts = (ArenaAccounts *)shmat(g_shm_accounts_id, NULL, 0);
-    g_runtime = (ArenaRuntime *)shmat(g_shm_runtime_id, NULL, 0);
-    
-    g_semid = semget(SEM_KEY, 1, IPC_CREAT | 0666);
-    g_msgid = msgget(MSG_KEY, IPC_CREAT | 0666);
-```
+---
 
-Logikanya adalah `orion` membuat memori bersama menggunakan `shmget` dengan parameter `IPC_CREAT` (alokasi di level sistem operasi). Kemudian `orion` dan `eternal` mengaitkan (attach) memori tersebut ke address space lokal mereka menggunakan `shmat`.
-
-- Message Queue (`msgget`): Digunakan untuk saling mengirim perintah (request/response) dengan struct `ArenaMessage` yang terstruktur (memiliki field `cmd`, `user_index`, dll).
-
-- Semaphore (`semget`): Digunakan sebagai pengunci akses (mutex/lock).
-Jika `eternal` dijalankan sebelum `orion` siap (mengecek status g_runtime->server_ready), maka program akan langsung mencetak error `Orion are you there?`.
-
-3. Sinkronisasi Data Mencegah Race Condition (Semaphore)
-
-Karena `orion` memproses request dari banyak `eternal` (klien), operasi baca-tulis harus dikunci agar tidak bentrok.
-
-```c
-static void lock_sem(void) {
-    struct sembuf op = {0, -1, SEM_UNDO};
-    semop(g_semid, &op, 1);
-}
-
-static void unlock_sem(void) {
-    struct sembuf op = {0, 1, SEM_UNDO};
-    semop(g_semid, &op, 1);
-}
-```
-
-Jadi sebelum membaca pesan (`msgrcv`) dari Message Queue dan memodifikasi health points (HP) atau antrean, `orion` akan memanggil `lock_sem()`. Ini akan mengurangi nilai semaphore menjadi 0 sehingga process lain yang mencoba mengakses memori yang sama harus menunda eksekusinya. Setelah pembaruan state selesai (misal setelah kalkulasi damage), server memanggil `unlock_sem()` agar memori dapat diakses kembali. `SEM_UNDO` memastikan bahwa jika proses `orion` tiba-tiba crash, sistem operasi otomatis melepaskan kuncian (lock) tersebut.
-
-4. Autentikasi Prajurit (Register & Login)
+### 2) `orion.c` - Register akun
 
 ```c
 static void handle_register(ArenaMessage *msg) {
+    if (msg->username[0] == '\0' || msg->password[0] == '\0') {
+        send_response(msg->pid, 1, RESP_ERR, -1, -1, "Username or password empty");
+        return;
+    }
     if (find_user_index(msg->username) >= 0) {
         send_response(msg->pid, 1, RESP_ERR, -1, -1, "Username already exists");
         return;
     }
-    // create_user(msg->username, msg->password)
+    if (create_user(msg->username, msg->password) < 0) {
+        send_response(msg->pid, 1, RESP_ERR, -1, -1, "User limit reached");
+        return;
+    }
     send_response(msg->pid, 0, RESP_REGISTER_OK, -1, -1, "Register success");
 }
 ```
 
-`Orion` menerima struktur pesan (`msg.cmd = CMD_REGISTER`) dari `eternal`. Server memvalidasi apakah nama pengguna (username) unik dengan mencarinya melalui iterasi di dalam array `g_accounts->users` pada Shared Memory. Jika unik, `create_user` dipanggil dan memberikan nilai inisial Lvl 1 (XP 0) dan Gold 150. Login (CMD_LOGIN) bekerja serupa dengan mencocokkan password dan mencegah login ganda melalui validasi `acc->active_pid != 0`.
+`handle_register` adalah gerbang awal pembuatan akun. Urutan logikanya: validasi field kosong, cek username sudah dipakai atau belum, lalu alokasikan slot akun baru melalui `create_user`. Jika salah satu tahap gagal, server langsung kirim response error spesifik; jika lolos semua tahap, server kirim `RESP_REGISTER_OK` agar client tahu akun berhasil dibuat.
 
-4. Sistem Matchmaking dan Bot (Wild Beast)
+### 3) `orion.c` - Login akun
+
+```c
+static void handle_login(ArenaMessage *msg) {
+    int idx = find_user_index(msg->username);
+    if (idx < 0) {
+        send_response(msg->pid, 1, RESP_ERR, -1, -1, "User not found");
+        return;
+    }
+    Account *acc = &g_accounts->users[idx];
+    if (strcmp(acc->password, msg->password) != 0) {
+        send_response(msg->pid, 1, RESP_ERR, -1, -1, "Wrong password");
+        return;
+    }
+    if (acc->active_pid != 0 && acc->active_pid != msg->pid) {
+        send_response(msg->pid, 1, RESP_ERR, -1, -1, "User already logged in");
+        return;
+    }
+    acc->active_pid = msg->pid;
+    acc->state = USER_ONLINE;
+    send_response(msg->pid, 0, RESP_LOGIN_OK, idx, -1, "Login success");
+}
+```
+
+`handle_login` memastikan autentikasi dan integritas sesi. Server mencari user, memverifikasi password, lalu mengecek apakah akun sedang aktif di PID lain untuk mencegah login ganda. Jika valid, `active_pid` diikat ke proses client saat ini dan state diubah menjadi `USER_ONLINE`, sehingga request selanjutnya bisa ditelusuri ke sesi yang benar.
+
+### 4) `orion.c` - Masuk antrean matchmaking
+
+```c
+static void handle_match(ArenaMessage *msg) {
+    int idx;
+    Account *acc = require_user(msg, &idx);
+    if (!acc) return;
+    if (acc->state == USER_MATCHING || acc->state == USER_IN_BATTLE) {
+        send_response(msg->pid, 1, RESP_ALREADY_MATCHING, idx, -1, "Already in queue or battle");
+        return;
+    }
+    if (g_runtime->waiting_count >= MAX_MATCH_QUEUE) {
+        send_response(msg->pid, 1, RESP_ERR, idx, -1, "Queue full");
+        return;
+    }
+    if (!user_in_queue(idx)) {
+        g_runtime->waiting_users[g_runtime->waiting_count] = idx;
+        g_runtime->waiting_since[g_runtime->waiting_count] = now_ms();
+        g_runtime->waiting_count++;
+        acc->state = USER_MATCHING;
+    }
+    send_response(msg->pid, 0, RESP_OK, idx, -1, "Queued");
+    try_match_queue();
+}
+```
+
+`handle_match` memindahkan pemain dari mode online ke mode pencarian lawan secara aman. Fungsi ini menolak request jika pemain sudah matchmaking/bertarung, mengecek kapasitas antrean, lalu menyimpan waktu masuk queue (`waiting_since`) untuk kebutuhan timeout. Setelah pemain resmi antre, server langsung memanggil `try_match_queue` agar pairing bisa terjadi secepat mungkin tanpa menunggu loop berikutnya.
+
+### 5) `orion.c` - Pairing PvP dan fallback bot
+
+```c
+static void try_match_queue(void) {
+    long long now = now_ms();
+    while (g_runtime->waiting_count >= 2) {
+        int room_idx = find_free_room(now);
+        if (room_idx < 0) return;
+        int p1 = g_runtime->waiting_users[0];
+        int p2 = g_runtime->waiting_users[1];
+        remove_from_queue(p1);
+        remove_from_queue(p2);
+        setup_room(&g_runtime->rooms[room_idx], room_idx, p1, p2);
+        g_accounts->users[p1].state = USER_IN_BATTLE;
+        g_accounts->users[p2].state = USER_IN_BATTLE;
+        pid_t pid1 = g_accounts->users[p1].active_pid;
+        pid_t pid2 = g_accounts->users[p2].active_pid;
+        send_response(pid1, 0, RESP_MATCH_FOUND, p1, room_idx, g_accounts->users[p2].username);
+        send_response(pid2, 0, RESP_MATCH_FOUND, p2, room_idx, g_accounts->users[p1].username);
+    }
+}
+```
+
+`try_match_queue` menjalankan proses pairing PvP otomatis selama minimal ada dua pemain di antrean. Server mengambil dua pemain terdepan, membuat room baru, mengubah status keduanya menjadi `USER_IN_BATTLE`, lalu mengirim informasi lawan ke masing-masing client. Dengan pola ini, antrean diproses FIFO dan transisi dari matchmaking ke battle terjadi atomik dari sisi server.
 
 ```c
 static void match_timeout_tick(void) {
     long long now = now_ms();
     int i = 0;
-
     while (i < g_runtime->waiting_count) {
+        int user_index = g_runtime->waiting_users[i];
         long long started = g_runtime->waiting_since[i];
         if (now - started < (long long)MATCH_TIMEOUT_SEC * 1000LL) {
             i++;
             continue;
         }
-        
         int room_idx = find_free_room(now);
+        if (room_idx < 0) { i++; continue; }
         setup_room(&g_runtime->rooms[room_idx], room_idx, user_index, -1);
-        
+        g_accounts->users[user_index].state = USER_IN_BATTLE;
+        pid_t pid = g_accounts->users[user_index].active_pid;
         send_response(pid, 0, RESP_MATCH_BOT, user_index, room_idx, "Match found vs Wild Beast");
         remove_from_queue(user_index);
     }
 }
 ```
 
-Pemain yang menekan menu "Battle" akan didaftarkan ke array `waiting_users`. Server secara continuous memanggil fungsi background `match_timeout_tick()` di dalam while loop utamanya. Jika selisih waktu antrean melebihi 35 detik (`MATCH_TIMEOUT_SEC`), prajurit dialihkan ke BattleRoom kosong melawan entitas -1 (bot). Logika Bot dijalankan melalui fungsi `bot_tick()` yang akan mengurangi HP prajurit secara acak antara 8-12 damage setiap detiknya jika lawannya adalah bot.
+`match_timeout_tick` berjalan periodik untuk menghindari pemain menunggu tanpa kepastian. Untuk setiap pemain di queue, server membandingkan waktu tunggu terhadap `MATCH_TIMEOUT_SEC`; jika melewati batas, pemain dipindah ke room battle melawan bot (`p2 = -1`) dan langsung diberi response `RESP_MATCH_BOT`. Mekanisme ini menjaga flow game tetap berjalan meskipun pemain online sedang sedikit.
 
-6. Asynchronous (Tanpa Turn-Based)
-
-Untuk membuat pertarungan murni berjalan secara real-time tanpa mengharuskan prajurit menekan tombol 'Enter', eternal.c memodifikasi flag terminal.
+### 6) `orion.c` - Sistem serangan realtime
 
 ```c
-static void enable_raw_mode(void) {
-    struct termios raw;
-    tcgetattr(STDIN_FILENO, &g_orig_term);
-    raw = g_orig_term;
-    raw.c_lflag &= (unsigned long)~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+static void handle_attack(ArenaMessage *msg, int is_ult) {
+    if (is_ult && attacker->weapon_bonus <= 0) return;
+    long long *last_action = (attacker_side == 1) ? &room->last_action_ms1 : &room->last_action_ms2;
+    if (now - *last_action < COOLDOWN_MS) return;
 
-    g_orig_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, g_orig_flags | O_NONBLOCK);
+    int dmg = calc_base_damage(attacker->xp, attacker->weapon_bonus);
+    if (is_ult) dmg *= 3;
+
+    if (defender_side == 1) room->hp1 -= dmg;
+    else room->hp2 -= dmg;
+
+    *last_action = now;
+    if (room->hp1 <= 0) finish_battle(room, 2);
+    else if (room->hp2 <= 0) finish_battle(room, 1);
 }
-
 ```
-Fungsi ini menonaktifkan mode `ICANON` (canonical) dan `ECHO` pada sistem terminal POSIX, mengubahnya menjadi Raw Mode. Dipadukan dengan flag `O_NONBLOCK`, input keyboard dapat langsung terbaca character-by-character menggunakan fungsi multiplexing `select()` dengan timeout hanya `100ms` (pendekatan rendering game loop). Jika ditekan tombol `a` (Attack) atau `u` (Ultimate) dan waktu `cooldown` telah terpenuhi (1 detik), klien segera menembakkan pesan perintah `CMD_ATTACK/CMD_ULT` ke server.
 
-7. Reward (XP & Gold) dan Armory
+`handle_attack` menangani inti combat realtime. Server terlebih dulu memastikan penyerang valid, masih berada di battle, dan (untuk ultimate) memiliki senjata. Setelah itu server menerapkan cooldown berbasis timestamp per sisi pemain, menghitung damage dari basis stat (XP + weapon bonus), lalu mengurangi HP lawan. Terakhir, server mengecek kondisi KO dan memanggil `finish_battle` untuk mengunci hasil pertandingan.
 
-Setelah pertarungan usai dengan cek room->hp1 <= 0 atau room->hp2 <= 0, fungsi finish_battle() akan menentukan reward.
-
-Penjelasan Reward: Pemenang menerima stat tinggi yang akan memengaruhi kalkulasi damage dan health base menggunakan rumus bawaan (Lvl = XP/100 + 1). History pertandingan juga direkam menggunakan circular list di fungsi append_history().
-
-Pembelian Senjata (Armory): Prajurit dapat membeli senjata untuk meningkatkan bonus demage dan membuka skill ultimate (hanya terbuka jika punya senjata).
+### 7) `orion.c` - Reward setelah pertandingan
 
 ```c
 static void finish_battle(BattleRoom *room, int winner_side) {
-    // Menang: +50 XP, +120 Gold
-    // Kalah: +15 XP, +30 Gold
-    if (winner_side == 1) {
-        acc->xp += 50;
-        acc->gold += 120;
-        append_history(acc, opp, 1, 50, 120);
-    } else {
-        acc->xp += 15;
-        acc->gold += 30;
-        append_history(acc, opp, 0, 15, 30);
+    int p1 = room->p1;
+    int p2 = room->p2;
+    room->finished = 1;
+    room->winner = winner_side;
+    if (p1 >= 0) {
+        Account *acc = &g_accounts->users[p1];
+        if (winner_side == 1) { acc->xp += 50; acc->gold += 120; }
+        else { acc->xp += 15; acc->gold += 30; }
+        acc->state = USER_ONLINE;
+    }
+    if (p2 >= 0) {
+        Account *acc = &g_accounts->users[p2];
+        if (winner_side == 2) { acc->xp += 50; acc->gold += 120; }
+        else { acc->xp += 15; acc->gold += 30; }
+        acc->state = USER_ONLINE;
     }
 }
 ```
+
+`finish_battle` menutup room secara resmi dengan memberi penanda `finished` dan menentukan pemenang. Fungsi ini lalu membagikan reward berdasarkan hasil (menang/kalah) ke masing-masing pemain, mengubah state pemain kembali ke `USER_ONLINE`, serta (pada implementasi penuh) menulis log/history match. Karena seluruh update dilakukan di server, hasil akhir match tetap sinkron untuk semua client.
+
+### 8) `orion.c` - Main loop server
 
 ```c
-static void handle_buy(ArenaMessage *msg) {
-    const Weapon *w = &g_weapons[choice];
-    if (acc->gold < w->cost) {
-        send_response(msg->pid, 1, RESP_BUY_FAIL, idx, -1, "Not enough gold");
-        return;
+int main(void) {
+    g_shm_accounts_id = shmget(SHM_ACCOUNTS_KEY, sizeof(ArenaAccounts), IPC_CREAT | 0666);
+    g_semid = semget(SEM_KEY, 1, IPC_CREAT | 0666);
+    g_msgid = msgget(MSG_KEY, IPC_CREAT | 0666);
+    ...
+    while (g_running) {
+        ssize_t n = msgrcv(g_msgid, &msg, sizeof(msg) - sizeof(long), 1, IPC_NOWAIT);
+        if (n >= 0) {
+            switch (msg.cmd) { ... }
+        }
+        match_timeout_tick();
+        bot_tick();
+        sleep_ms(100);
     }
-    acc->gold -= w->cost;
-    acc->weapon_bonus = w->bonus; // Status tersimpan di shared memory
-    send_response(msg->pid, 0, RESP_BUY_OK, idx, -1, "Purchase success");
+    cleanup_ipc();
 }
 ```
 
-Gold yang mencukupi akan dikurangi dan nilai weapon_bonus milik klien dimodifikasi secara permanen, memungkinkan kalkulator penyerangan di dalam server menambahkan damage point tambahan untuk klien tersebut ke depannya.
+`main` pada server mengorkestrasi seluruh siklus hidup `orion`: inisialisasi resource IPC, validasi bahwa tidak ada instance server ganda, lalu menjalankan loop event utama. Di dalam loop, server membaca command dari message queue, mendispatch ke handler sesuai jenis command, menjalankan tick periodik (timeout matchmaking + aksi bot), dan tidur singkat untuk menjaga CPU tetap efisien. Saat menerima sinyal stop, server melakukan cleanup IPC agar resource tidak tertinggal.
 
-Untuk script lengkap dapat dilihat pada file [`soal_2/orion.c`](soal_2/orion.c) dan [`soal_2/eternal.c`](soal_2/eternal.c).
+---
+
+### 9) `eternal.c` - Koneksi IPC dari client
+
+```c
+static int connect_ipc(void) {
+    g_shm_accounts_id = shmget(SHM_ACCOUNTS_KEY, sizeof(ArenaAccounts), 0666);
+    g_shm_runtime_id = shmget(SHM_RUNTIME_KEY, sizeof(ArenaRuntime), 0666);
+    g_shm_aux_id = shmget(SHM_AUX_KEY, sizeof(ArenaAux), 0666);
+    if (g_shm_accounts_id < 0 || g_shm_runtime_id < 0 || g_shm_aux_id < 0) return -1;
+    g_semid = semget(SEM_KEY, 1, 0666);
+    g_msgid = msgget(MSG_KEY, 0666);
+    if (g_semid < 0 || g_msgid < 0) return -1;
+    return 0;
+}
+```
+
+`connect_ipc` adalah tahap bootstrap client ke server. Fungsi ini mencoba membuka shared memory, semaphore, dan message queue dengan key yang sama seperti server. Jika salah satu resource tidak ditemukan, fungsi mengembalikan gagal sehingga client bisa menampilkan pesan bahwa `orion` belum aktif.
+
+### 10) `eternal.c` - Matchmaking dari sisi pemain
+
+```c
+static void matchmaking(void) {
+    msg.cmd = CMD_MATCH;
+    send_request(&msg);
+    ...
+    if (resp.code == RESP_MATCH_FOUND) battle_loop(resp.room_id, resp.text);
+    if (resp.code == RESP_MATCH_BOT) battle_loop(resp.room_id, BOT_NAME);
+}
+```
+
+`matchmaking` mengirim command `CMD_MATCH` lalu masuk ke loop tunggu respons non-blocking sambil memperbarui UI countdown. Jika server mengirim `RESP_MATCH_FOUND`, client masuk battle melawan pemain; jika `RESP_MATCH_BOT`, client masuk battle melawan Wild Beast. Dengan cara ini, pengguna tetap melihat progres pencarian lawan secara realtime tanpa membuat UI freeze.
+
+### 11) `eternal.c` - Battle realtime (input `a` / `u`)
+
+```c
+static void battle_loop(int room_id, const char *opp_name) {
+    enable_raw_mode();
+    while (1) {
+        BattleRoom room = get_room_snapshot(room_id);
+        ...
+        if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) > 0) {
+            if (ch == 'a' || ch == 'A') send_battle_action(room_id, CMD_ATTACK);
+            else if (ch == 'u' || ch == 'U') send_battle_action(room_id, CMD_ULT);
+        }
+    }
+}
+```
+
+`battle_loop` adalah loop interaktif utama saat pertarungan berlangsung. Client mengambil snapshot room berkala dari shared memory untuk merender HP/log/cooldown, lalu memantau input keyboard menggunakan `select()` agar tidak blocking. Ketika tombol `a` atau `u` ditekan, client hanya mengirim command aksi ke server; seluruh validasi damage/cooldown tetap diputuskan server agar state battle tetap otoritatif dan fair.
+
+### 12) `eternal.c` - Armory (beli senjata)
+
+```c
+static void show_armory(void) {
+    for (i = 0; i < MAX_WEAPONS; i++) {
+        printf("%d. %-12s  %4d G  %+4d Dmg\n", ...);
+    }
+    msg.cmd = CMD_BUY;
+    msg.arg1 = choice - 1;
+    send_request(&msg);
+    recv_response(&resp, 0);
+}
+```
+
+`show_armory` menampilkan daftar senjata beserta harga dan bonus damage agar pemain bisa memilih upgrade secara sadar. Setelah pemain memilih item, client mengirim `CMD_BUY` dengan indeks item (`arg1`). Keputusan pembelian (berhasil/gagal karena gold kurang atau input invalid) tetap diproses server, lalu hasilnya dikirim balik sebagai response.
+
+### 13) `eternal.c` - Main loop client
+
+```c
+int main(void) {
+    if (connect_ipc() != 0) {
+        printf("Orion are you there?\n");
+        return 1;
+    }
+    while (1) {
+        show_guest_menu();
+        switch (choice) {
+            case 1: register_user(); break;
+            case 2: login_user(); break;
+            case 3: return 0;
+        }
+    }
+}
+```
+
+`main` client mengatur alur dari awal sampai keluar aplikasi: cek koneksi ke server, tampilkan menu guest, lalu routing ke register/login/exit sesuai pilihan user. Struktur loop ini memisahkan fase sebelum login dan sesudah login dengan jelas, sehingga navigasi fitur (battle, armory, history, logout) lebih terkontrol dan mudah diikuti.
+
+## Kendala / Error Selama Pengerjaan
+
+1. Race condition antar proses saat data akun/room diakses bersamaan.  
+   Solusi: semua akses kritikal dibungkus semaphore.
+2. Input battle realtime rawan tidak responsif.  
+   Solusi: mode non-canonical + `select()` + refresh periodik.
+3. Pemain dapat menunggu lama di matchmaking.  
+   Solusi: timeout 35 detik dan fallback lawan bot.
+
+## Dokumentasi Output / Screenshot
+
+### A. Build dan Menjalankan Program
+![Build dan Run Server-Client](assets/soal_2/soal2_build_run.png)
+
+### B. Register dan Login
+#### Register
+![Register](assets/soal_2/soal2_register.png)
+#### Login
+![Login](assets/soal_2/soal2_login.png)
+#### Login Duplicate
+![Login Duplicate](assets/soal_2/soal2_login_duplicate.png)
+
+### C. Matchmaking dan Masuk Battle
+![Matchmaking Battle](assets/soal_2/soal2_matchmaking_battle.png)
+
+### D. Armory dan Pembelian Senjata
+![Armory](assets/soal_2/soal2_armory.png)
+
+### E. History Pertandingan
+![History](assets/soal_2/soal2_history.png)
